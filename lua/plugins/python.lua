@@ -26,6 +26,73 @@ local function python_exe()
   return "python"
 end
 
+--- 组一条能直接交给 vim.system 的命令；返回 解释器路径, 命令表
+---@param file string 要执行的 .py 文件
+---@return string, string[]
+local function python_cmd(file)
+  local exe = python_exe()
+  if exe == "python" then
+    -- 只有彻底找不到解释器才会走到这里：交给 shell 去展开别名
+    if vim.fn.has("win32") == 1 then
+      return exe, { vim.o.shell, "/c", "python", file }
+    end
+    return exe, { "sh", "-c", ("python %s"):format(vim.fn.shellescape(file)) }
+  end
+  return exe, { exe, file }
+end
+
+--- 把一条命令跑起来，stdout + stderr 写进底部只读 buffer。
+--- 没有终端模式：j/k、搜索、ggVG"+y 都是普通 buffer 的行为。
+---@param name string buffer 名（同名会先删掉，避免 E95）
+---@param display string 显示在首行的命令
+---@param cmd string[]
+---@param cleanup? fun() 进程结束后执行（用来删临时文件）
+local function run_in_buffer(name, display, cmd, cleanup)
+  local old = vim.fn.bufnr(name)
+  if old > 0 then
+    vim.api.nvim_buf_delete(old, { force = true })
+  end
+
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[buf].buftype = "nofile"
+  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].swapfile = false
+  vim.api.nvim_buf_set_name(buf, name)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "$ " .. display, "（运行中…）" })
+
+  vim.cmd("botright split")
+  vim.api.nvim_win_set_buf(0, buf)
+  vim.api.nvim_win_set_height(0, 15)
+
+  -- 只在这块输出 buffer 里生效
+  vim.keymap.set("n", "q", "<cmd>close<CR>", { buffer = buf, desc = "关闭输出窗口" })
+  vim.keymap.set("n", "<C-y>", function()
+    vim.fn.setreg("+", table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n"))
+    vim.notify("[python] 已复制全部输出到剪贴板")
+  end, { buffer = buf, desc = "复制全部输出" })
+
+  vim.system(cmd, { cwd = vim.fn.getcwd(), text = true }, function(res)
+    vim.schedule(function()
+      if cleanup then
+        pcall(cleanup)
+      end
+      if not vim.api.nvim_buf_is_valid(buf) then
+        return
+      end
+      local lines = vim.split((res.stdout or "") .. (res.stderr or ""), "\n", { plain = true })
+      while #lines > 0 and lines[#lines] == "" do
+        table.remove(lines)
+      end
+      table.insert(lines, 1, "$ " .. display)
+      table.insert(lines, "")
+      table.insert(lines, ("[exit %d]"):format(res.code or -1))
+      vim.bo[buf].modifiable = true
+      vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+      vim.bo[buf].modifiable = false
+    end)
+  end)
+end
+
 return {
   -- 想让类型检查更严（默认 standard）
   {
@@ -53,10 +120,9 @@ return {
     },
   },
 
-  -- 跑当前文件：<leader>rr
-  -- 用 vim.system 异步跑，输出写进一块只读的 nofile buffer：没有终端模式，
-  -- j/k、搜索、ggVG"+y 都是普通 buffer 的行为。窗口关掉内容就没了
-  -- （bufhidden=wipe），想留档就在输出窗口里 :w out.txt。
+  -- 跑代码：输出进只读 buffer
+  --   <leader>rr      普通模式 = 整个文件（先存盘）
+  --   <leader>rr      可视模式 = 只跑选中的那几行（写到临时文件再跑）
   {
     "folke/snacks.nvim",
     keys = {
@@ -70,66 +136,50 @@ return {
           if vim.bo.modified then
             vim.cmd.write()
           end
-
-          -- 解释器：python_exe() 一般给绝对路径；只剩裸 "python" 时交给 shell 展开
-          -- （Windows 的 WindowsApps 别名是 0 字节 ReparsePoint，libuv 直接 spawn 会 E475）
-          local exe = python_exe()
-          local cmd
-          if exe == "python" then
-            cmd = vim.fn.has("win32") == 1 and { vim.o.shell, "/c", "python", file }
-              or { "sh", "-c", ("python %s"):format(vim.fn.shellescape(file)) }
-          else
-            cmd = { exe, file }
-          end
-
-          -- 同名 buffer 先清掉，避免 E95
-          local name = ("python-run://%s"):format(vim.fn.fnamemodify(file, ":t"))
-          local old = vim.fn.bufnr(name)
-          if old > 0 then
-            vim.api.nvim_buf_delete(old, { force = true })
-          end
-
-          local buf = vim.api.nvim_create_buf(false, true)
-          vim.bo[buf].buftype = "nofile"
-          vim.bo[buf].bufhidden = "wipe"
-          vim.bo[buf].swapfile = false
-          vim.api.nvim_buf_set_name(buf, name)
-          vim.api.nvim_buf_set_lines(buf, 0, -1, false, {
-            ("$ %s %s"):format(exe, file),
-            "（运行中…）",
-          })
-
-          vim.cmd("botright split")
-          vim.api.nvim_win_set_buf(0, buf)
-          vim.api.nvim_win_set_height(0, 15)
-
-          -- 只在这块输出 buffer 里生效
-          vim.keymap.set("n", "q", "<cmd>close<CR>", { buffer = buf, desc = "关闭输出窗口" })
-          vim.keymap.set("n", "<C-y>", function()
-            vim.fn.setreg("+", table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n"))
-            vim.notify("[python] 已复制全部输出到剪贴板")
-          end, { buffer = buf, desc = "复制全部输出" })
-
-          vim.system(cmd, { cwd = vim.fn.getcwd(), text = true }, function(res)
-            vim.schedule(function()
-              if not vim.api.nvim_buf_is_valid(buf) then
-                return
-              end
-              local lines = vim.split((res.stdout or "") .. (res.stderr or ""), "\n", { plain = true })
-              while #lines > 0 and lines[#lines] == "" do
-                table.remove(lines)
-              end
-              table.insert(lines, 1, ("$ %s %s"):format(exe, file))
-              table.insert(lines, "")
-              table.insert(lines, ("[exit %d]"):format(res.code or -1))
-              vim.bo[buf].modifiable = true
-              vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-              vim.bo[buf].modifiable = false
-            end)
-          end)
+          local exe, cmd = python_cmd(file)
+          run_in_buffer(
+            ("python-run://%s"):format(vim.fn.fnamemodify(file, ":t")),
+            ("%s %s"):format(exe, file),
+            cmd
+          )
         end,
         desc = "Run Python File",
         ft = "python",
+      },
+
+      {
+        "<leader>rr",
+        function()
+          -- 先离开可视模式，'< 和 '> 才会被置上
+          vim.cmd("normal! \27")
+          local s = vim.fn.line("'<")
+          local e = vim.fn.line("'>")
+          if s <= 0 or e <= 0 then
+            return vim.notify("[python] 没有选中任何行", vim.log.levels.WARN)
+          end
+          if s > e then
+            s, e = e, s
+          end
+          local lines = vim.api.nvim_buf_get_lines(0, s - 1, e, false)
+          if #lines == 0 then
+            return vim.notify("[python] 选中的范围是空的", vim.log.levels.WARN)
+          end
+
+          local tmp = vim.fn.tempname() .. ".py"
+          vim.fn.writefile(lines, tmp)
+          local exe, cmd = python_cmd(tmp)
+          run_in_buffer(
+            "python-run://selection.py",
+            ("%s <选中 %s 第 %d-%d 行>"):format(exe, vim.fn.expand("%:t"), s, e),
+            cmd,
+            function()
+              vim.fn.delete(tmp)
+            end
+          )
+        end,
+        desc = "Run Python Selection",
+        ft = "python",
+        mode = "x",
       },
     },
   },
