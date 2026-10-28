@@ -54,6 +54,9 @@ return {
   },
 
   -- 跑当前文件：<leader>rr
+  -- 用 vim.system 异步跑，输出写进一块只读的 nofile buffer：没有终端模式，
+  -- j/k、搜索、ggVG"+y 都是普通 buffer 的行为。窗口关掉内容就没了
+  -- （bufhidden=wipe），想留档就在输出窗口里 :w out.txt。
   {
     "folke/snacks.nvim",
     keys = {
@@ -67,20 +70,63 @@ return {
           if vim.bo.modified then
             vim.cmd.write()
           end
-          -- 关键：传「字符串」而不是 { "python", ... } 列表。
-          -- 字符串会让 jobstart 通过 shell 执行，Windows 的应用别名也能展开；
-          -- 传列表则是 libuv 直接 spawn，遇到 0 字节别名就 E475。
-          local native = function(p)
-            return vim.fn.has("win32") == 1 and (p:gsub("/", "\\")) or p
+
+          -- 解释器：python_exe() 一般给绝对路径；只剩裸 "python" 时交给 shell 展开
+          -- （Windows 的 WindowsApps 别名是 0 字节 ReparsePoint，libuv 直接 spawn 会 E475）
+          local exe = python_exe()
+          local cmd
+          if exe == "python" then
+            cmd = vim.fn.has("win32") == 1 and { vim.o.shell, "/c", "python", file }
+              or { "sh", "-c", ("python %s"):format(vim.fn.shellescape(file)) }
+          else
+            cmd = { exe, file }
           end
-          local cmd = vim.fn.shellescape(native(python_exe())) .. " " .. vim.fn.shellescape(native(file))
-          -- snacks 默认 interactive = true，会连带 auto_close = true：
-          -- 进程一退出窗口就关，所以你只看到“闪一下”，输出根本没机会看。
-          -- 想改成底部横条而不是浮窗，再加 win = { position = "bottom", height = 15 }
-          Snacks.terminal.open(cmd, {
-            cwd = vim.fn.getcwd(),
-            auto_close = false,
+
+          -- 同名 buffer 先清掉，避免 E95
+          local name = ("python-run://%s"):format(vim.fn.fnamemodify(file, ":t"))
+          local old = vim.fn.bufnr(name)
+          if old > 0 then
+            vim.api.nvim_buf_delete(old, { force = true })
+          end
+
+          local buf = vim.api.nvim_create_buf(false, true)
+          vim.bo[buf].buftype = "nofile"
+          vim.bo[buf].bufhidden = "wipe"
+          vim.bo[buf].swapfile = false
+          vim.api.nvim_buf_set_name(buf, name)
+          vim.api.nvim_buf_set_lines(buf, 0, -1, false, {
+            ("$ %s %s"):format(exe, file),
+            "（运行中…）",
           })
+
+          vim.cmd("botright split")
+          vim.api.nvim_win_set_buf(0, buf)
+          vim.api.nvim_win_set_height(0, 15)
+
+          -- 只在这块输出 buffer 里生效
+          vim.keymap.set("n", "q", "<cmd>close<CR>", { buffer = buf, desc = "关闭输出窗口" })
+          vim.keymap.set("n", "<C-y>", function()
+            vim.fn.setreg("+", table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n"))
+            vim.notify("[python] 已复制全部输出到剪贴板")
+          end, { buffer = buf, desc = "复制全部输出" })
+
+          vim.system(cmd, { cwd = vim.fn.getcwd(), text = true }, function(res)
+            vim.schedule(function()
+              if not vim.api.nvim_buf_is_valid(buf) then
+                return
+              end
+              local lines = vim.split((res.stdout or "") .. (res.stderr or ""), "\n", { plain = true })
+              while #lines > 0 and lines[#lines] == "" do
+                table.remove(lines)
+              end
+              table.insert(lines, 1, ("$ %s %s"):format(exe, file))
+              table.insert(lines, "")
+              table.insert(lines, ("[exit %d]"):format(res.code or -1))
+              vim.bo[buf].modifiable = true
+              vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+              vim.bo[buf].modifiable = false
+            end)
+          end)
         end,
         desc = "Run Python File",
         ft = "python",
